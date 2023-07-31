@@ -63,9 +63,12 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/safehtml/template"
+	"golang.ngrok.com/ngrok"
+	"golang.ngrok.com/ngrok/config"
 	"golang.org/x/pkgsite/internal"
 	"golang.org/x/pkgsite/internal/browser"
 	"golang.org/x/pkgsite/internal/fetch"
@@ -83,12 +86,14 @@ import (
 const defaultAddr = "localhost:8080" // default webserver address
 
 var (
-	httpAddr   = flag.String("http", defaultAddr, "HTTP service address to listen for incoming requests on")
-	goRepoPath = flag.String("gorepo", "", "path to Go repo on local filesystem")
-	useProxy   = flag.Bool("proxy", false, "fetch from GOPROXY if not found locally")
-	devMode    = flag.Bool("dev", false, "enable developer mode (reload templates on each page load, serve non-minified JS/CSS, etc.)")
-	staticFlag = flag.String("static", "static", "path to folder containing static files served")
-	openFlag   = flag.Bool("open", false, "open a browser window to the server's address")
+	ngrokLabels = flag.String("ngrok-labels", "", "Set to make pkgsite run an ngrok tunnel with the provided labels")
+	ngrokDomain = flag.String("ngrok-domain", "", "Set to make pkgsite run an ngrok tunnel with the provided domain. Set to the magic string 'auto' to bind to a random tunnel address")
+	httpAddr    = flag.String("http", "", "HTTP service address to listen for incoming requests on")
+	goRepoPath  = flag.String("gorepo", "", "path to Go repo on local filesystem")
+	useProxy    = flag.Bool("proxy", false, "fetch from GOPROXY if not found locally")
+	devMode     = flag.Bool("dev", false, "enable developer mode (reload templates on each page load, serve non-minified JS/CSS, etc.)")
+	staticFlag  = flag.String("static", "static", "path to folder containing static files served")
+	openFlag    = flag.Bool("open", false, "open a browser window to the server's address")
 	// other flags are bound to serverConfig below
 )
 
@@ -148,31 +153,88 @@ func main() {
 	}
 
 	addr := *httpAddr
-	if addr == "" {
-		addr = ":http"
+	if addr == "" && *ngrokLabels == "" && *ngrokDomain == "" {
+		addr = defaultAddr
 	}
 
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		die(err.Error())
-	}
+	var lns []net.Listener
+	if *ngrokLabels != "" || *ngrokDomain != "" {
+		sess, err := ngrok.Connect(ctx, ngrok.WithAuthtokenFromEnv())
+		if err != nil {
+			die("error connecting to ngrok: %v", err)
+		}
+		defer sess.Close()
 
-	url := "http://" + addr
-	log.Infof(ctx, "Listening on addr %s", url)
-
-	if *openFlag {
-		go func() {
-			if !browser.Open(url) {
-				log.Infof(ctx, "Failed to open browser window. Please visit %s in your browser.", url)
+		if *ngrokLabels != "" {
+			labels := strings.Split(*ngrokLabels, ",")
+			var labelOpts []config.LabeledTunnelOption
+			for _, l := range labels {
+				lhs, rhs, ok := strings.Cut(l, "=")
+				if !ok {
+					die("malformed label %q", l)
+				}
+				labelOpts = append(labelOpts, config.WithLabel(lhs, rhs))
 			}
-		}()
+			ln, err := sess.Listen(
+				ctx,
+				config.LabeledTunnel(labelOpts...),
+			)
+			if err != nil {
+				die("error creating ngrok tunnel: %v", err)
+			}
+			log.Infof(ctx, "listening with tunnel %q (%v)", ln.ID(), ln.Labels())
+			lns = append(lns, ln)
+		}
+		switch *ngrokDomain {
+		case "":
+			// no tunnel
+		case "auto":
+			ln, err := sess.Listen(ctx, config.HTTPEndpoint())
+			if err != nil {
+				die("error creating ngrok auto http tunnel: %v", err)
+			}
+			log.Infof(ctx, "listening with tunnel %q on URL %s", ln.ID(), ln.URL())
+			lns = append(lns, ln)
+		default:
+			ln, err := sess.Listen(ctx, config.HTTPEndpoint(config.WithDomain(*ngrokDomain)))
+			if err != nil {
+				die("error creating ngrok %q http tunnel: %v", *ngrokDomain, err)
+			}
+			lns = append(lns, ln)
+		}
+	}
+	if addr != "" {
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			die(err.Error())
+		}
+
+		url := "http://" + addr
+		log.Infof(ctx, "Listening on addr %s", url)
+		lns = append(lns, ln)
+
+		if *openFlag {
+			go func() {
+				if !browser.Open(url) {
+					log.Infof(ctx, "Failed to open browser window. Please visit %s in your browser.", url)
+				}
+			}()
+		}
 	}
 
 	router := http.NewServeMux()
 	server.Install(router.Handle, nil, nil)
 	mw := middleware.Timeout(54 * time.Second)
 	srv := &http.Server{Addr: addr, Handler: mw(router)}
-	die("%v", srv.Serve(ln))
+	var waitServers sync.WaitGroup
+	for _, ln := range lns {
+		waitServers.Add(1)
+		go func(ln net.Listener) {
+			defer waitServers.Done()
+			die("%v", srv.Serve(ln))
+		}(ln)
+	}
+	waitServers.Wait()
 }
 
 func die(format string, args ...any) {
